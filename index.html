@@ -95,12 +95,13 @@
 <!-- ③ 预演（eth_call） -->
 <div class="card">
   <div class="section-title"><h2>③ 签名前预演（eth_call）</h2>
-    <span class="muted small">粘贴离线端生成的 tx_human.json</span>
+    <span class="muted small">粘贴或扫码离线端生成的 tx_human.json</span>
   </div>
   <label>tx_human.json
     <textarea id="tx_human" placeholder='{"kind":"ERC20","from":"0x...","token":"0x...","to":"0x...","amount_smallest_unit":1000000,"data_hex":"0xa9059cbb...","value_wei":0,"chainId":1,"nonce":12,"gas":60000}'></textarea>
   </label>
   <div class="row">
+    <button id="scan_tx_human" class="ghost">扫码 tx_human.json</button>
     <button id="simulate">在两条 RPC 上预演</button>
     <span id="simulate_status" class="muted"></span>
   </div>
@@ -146,7 +147,8 @@
   }
 
   // ========== 摄像头扫码（复用一套） ==========
-  let scanTarget = null; // "intent_json" | "intent_sig" | "rawtx"
+  // 支持的目标：intent_json | intent_sig | rawtx | tx_human
+  let scanTarget = null;
   let stream = null, rafId = null;
 
   async function startScan(target) {
@@ -200,6 +202,13 @@
           log($("intent_status"), "已填入 intent.json（来自二维码）");
           return;
         } catch {}
+      } else if (scanTarget === "tx_human") {
+        try {
+          JSON.parse(txt);
+          $("tx_human").value = txt; stopScan();
+          log($("simulate_status"), "已填入 tx_human.json（来自二维码）");
+          return;
+        } catch {}
       }
     }
     rafId = requestAnimationFrame(tick);
@@ -208,6 +217,7 @@
   $("scan_intent_json").onclick = ()=> startScan("intent_json");
   $("scan_intent_sig").onclick  = ()=> startScan("intent_sig");
   $("scan_rawtx").onclick       = ()=> startScan("rawtx");
+  $("scan_tx_human").onclick    = ()=> startScan("tx_human");
 
   // ========== ① 验证 Intent ==========
   $("verify_intent").onclick = async ()=>{
@@ -216,7 +226,6 @@
       const intent = JSON.parse($("intent_json").value || "{}");
       const sig = ($("intent_sig").value || "").trim();
       if (!sig) throw new Error("缺少签名（intent.sig）");
-      // 组装 EIP-712 域和类型（与离线端保持一致）
       const domain = { name:"PaymentIntent", version:"1", chainId:Number(intent.chainId||0), verifyingContract:"0x0000000000000000000000000000000000000000" };
       const types = { PaymentIntent:[
         {name:"payee",type:"address"},
@@ -227,7 +236,6 @@
         {name:"nonce",type:"bytes32"},
         {name:"memo",type:"string"},
       ]};
-      // 用 v6 验证签名
       const recovered = ethers.verifyTypedData(domain, types, intent, sig);
       const ok = (recovered.toLowerCase() === String(intent.payee||"").toLowerCase());
       log($("intent_status"), ok ? "验签通过" : "验签失败");
@@ -250,11 +258,8 @@
       if (!/^0x[0-9a-fA-F]+$/.test(raw) || raw.length<=100) throw new Error("RawTx 格式不正确");
       const txhash = ethers.keccak256(raw);
       log($("broadcast_status"), "计算本地 txhash: " + txhash);
-      // 并发广播
-      const urls = [u1,u2];
-      const names = ["RPC_1","RPC_2"];
+      const urls = [u1,u2], names = ["RPC_1","RPC_2"];
       const results = await Promise.allSettled(urls.map(u => rpcCall(u,"eth_sendRawTransaction",[raw])));
-      // 渲染表格
       const rows = results.map((r,i)=>{
         if (r.status==="fulfilled") {
           return `<tr><td>${names[i]}</td><td class="mono">${escapeHtml(urls[i])}</td><td class="ok">OK</td><td class="mono">${escapeHtml(r.value)}</td></tr>`;
@@ -265,7 +270,6 @@
       box.innerHTML = `
         <div class="muted" style="margin:6px 0">本地计算 txhash：<span class="mono">${txhash}</span></div>
         <table><tr><th>RPC</th><th>URL</th><th>结果</th><th>响应/错误</th></tr>${rows}</table>`;
-      // 自动填入查询栏
       $("txhash").value = txhash;
     }catch(e){
       log($("broadcast_status"), "错误：" + e.message);
