@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8" />
-<title>安全转账 · 在线端（验证 / 预演 / 广播 / 查询）</title>
+<title>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root{--fg:#111827;--muted:#6b7280;--ok:#16a34a;--bad:#dc2626;--br:#e5e7eb;--bg:#fff}
@@ -24,16 +24,17 @@
   .ok{color:var(--ok);font-weight:700}
   .bad{color:var(--bad);font-weight:700}
   table{width:100%;border-collapse:collapse}
-  th,td{padding:8px;border-bottom:1px solid var(--br);text-align:left}
+  th,td{padding:8px;border-bottom:1px solid var(--br);text-align:left;vertical-align:top}
   video{width:100%;max-height:260px;background:#000;border-radius:10px}
   canvas{display:none}
   .pill{display:inline-block;padding:2px 8px;border-radius:9999px;background:#eef2ff;color:#4338ca;font-size:12px}
   .section-title{display:flex;align-items:center;justify-content:space-between;gap:10px}
   .small{font-size:12px}
+  .num{white-space:nowrap}
 </style>
 </head>
 <body>
-<h1>安全转账 · 在线端（验证 / 预演 / 广播 / 查询）</h1>
+<h1>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算）</h1>
 
 <div class="card">
   <div class="section-title">
@@ -119,6 +120,24 @@
   <div id="query_table_box" style="margin-top:12px"></div>
 </div>
 
+<!-- ⑤ MetaMask 风格的 Gas 估算（低/中/高） -->
+<div class="card">
+  <div class="section-title">
+    <h2>⑤ Gas 估算（低 / 中 / 高）</h2>
+    <span class="muted small">基于 tx_human.json 的真实 to/data/value 进行 estimateGas；feeHistory 计算 EIP-1559 费用档位</span>
+  </div>
+  <div class="row">
+    <label class="small">
+      gasLimit 缓冲（%）
+      <input id="gas_buffer_pct" type="number" value="20" style="width:90px" />
+    </label>
+    <button id="estimate_gas">估算（双 RPC）</button>
+    <span id="estimate_status" class="muted"></span>
+  </div>
+  <div id="estimate_table_box" style="margin-top:12px"></div>
+  <p class="muted small">提示：Gas 与“代币数量”通常无关；复杂合约路径除外。本估算以你提供的 tx_human.json 为准。</p>
+</div>
+
 <!-- 依赖：ethers v6 + jsQR（在线端用 CDN 更方便） -->
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.11.1/dist/ethers.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
@@ -138,13 +157,13 @@
     if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
     return j.result;
   }
-
   function requireRPCs() {
     const u1 = $("rpc1").value.trim();
     const u2 = $("rpc2").value.trim();
     if (!u1 || !u2) throw new Error("请先填写 RPC_URL_1 与 RPC_URL_2");
     return [u1, u2];
   }
+  const toHex = (n)=> "0x"+BigInt(n).toString(16);
 
   // ========== 摄像头扫码（复用一套） ==========
   // 支持的目标：intent_json | intent_sig | rawtx | tx_human
@@ -339,6 +358,104 @@
     }catch(e){
       log($("query_status"), "错误：" + e.message);
       box.innerHTML = "";
+    }
+  };
+
+  // ========== ⑤ Gas 估算（低/中/高） ==========
+  $("estimate_gas").onclick = async ()=>{
+    const box = $("estimate_table_box");
+    try{
+      const [u1,u2] = requireRPCs();
+      const h = JSON.parse($("tx_human").value||"{}");
+      // 构造 estimateGas 调用体
+      const tx = {
+        from: h.from,
+        to: h.kind==="ETH" ? h.to : h.token,
+        data: h.data_hex || "0x",
+        value: "0x" + BigInt(h.value_wei||0).toString(16)
+      };
+      const bufferPct = Math.max(0, Number($("gas_buffer_pct").value || 0));
+      const urls=[u1,u2], names=["RPC_1","RPC_2"];
+
+      // 对每条 RPC 并行：estimateGas + feeHistory
+      const results = await Promise.allSettled(urls.map(async (u)=>{
+        const gasHex = await rpcCall(u,"eth_estimateGas",[tx]);
+        const gas = parseInt(gasHex, 16);
+        const gasBuffered = Math.ceil(gas * (1 + bufferPct/100));
+
+        // feeHistory：取近 10 个区块，分位点 10 / 50 / 90
+        const fh = await rpcCall(u,"eth_feeHistory",[10, "latest", [10,50,90]]);
+        // baseFeePerGas：数组 hex，取最后一个（最新区块的 baseFee）
+        const baseFees = (fh.baseFeePerGas||[]).map(x=> BigInt(x));
+        const baseFeeLatest = baseFees[baseFees.length-1] ?? 0n;
+        // priority rewards：二维数组 [block][percentileIndex]，取每个分位的中位数（防毛刺）
+        const rewards = (fh.reward||[]).map(row=> row.map(x=> BigInt(x)));
+        const pickMedian = (arr)=> arr.slice().sort((a,b)=> (a<b?-1:1))[Math.floor(arr.length/2)] || 0n;
+        const col = (idx)=> rewards.map(r=> r[idx]).filter(Boolean);
+        const p10 = pickMedian(col(0));
+        const p50 = pickMedian(col(1));
+        const p90 = pickMedian(col(2));
+
+        // 档位系数（可按需调整）
+        const tier = (name, priority, baseMul)=> {
+          const maxPriorityFeePerGas = priority; // wei
+          const maxFeePerGas = baseFeeLatest * BigInt(Math.round(baseMul*100)) / 100n + maxPriorityFeePerGas;
+          const feeTotalWei = BigInt(gasBuffered) * maxFeePerGas;
+          return { name, gas, gasBuffered, baseFeeLatest, maxPriorityFeePerGas, maxFeePerGas, feeTotalWei };
+        };
+        // 低/中/高（baseFee 乘数 1.2 / 1.5 / 2.0）
+        return {
+          url: u,
+          tiers: [
+            tier("低速", p10, 1.2),
+            tier("中速", p50, 1.5),
+            tier("高速", p90, 2.0),
+          ]
+        };
+      }));
+
+      // 渲染
+      const fmtGwei = (wei)=> (Number(wei) / 1e9).toFixed(3) + " gwei";
+      const fmtEth  = (wei)=> (Number(wei) / 1e18).toFixed(6) + " ETH";
+
+      const tables = results.map((r,i)=>{
+        if (r.status!=="fulfilled") {
+          return `<div class="muted"><b>${names[i]}</b>：<span class="bad">FAIL</span> ${escapeHtml(r.reason.message||String(r.reason))}</div>`;
+        }
+        const {url, tiers} = r.value;
+        const rows = tiers.map(t=>{
+          return `<tr>
+            <td>${t.name}</td>
+            <td class="num mono">${t.gas}</td>
+            <td class="num mono">${t.gasBuffered}</td>
+            <td class="num mono">${fmtGwei(t.baseFeeLatest)}</td>
+            <td class="num mono">${fmtGwei(t.maxPriorityFeePerGas)}</td>
+            <td class="num mono">${fmtGwei(t.maxFeePerGas)}</td>
+            <td class="num mono">${fmtEth(t.feeTotalWei)}</td>
+          </tr>`;
+        }).join("");
+        return `
+          <div class="muted small" style="margin:6px 0"><b>${names[i]}</b> · ${escapeHtml(url)}</div>
+          <table>
+            <tr>
+              <th>档位</th>
+              <th>估算 gasLimit</th>
+              <th>gasLimit（含缓冲）</th>
+              <th>baseFee</th>
+              <th>maxPriorityFee</th>
+              <th>maxFeePerGas</th>
+              <th>预计总费用</th>
+            </tr>
+            ${rows}
+          </table>
+        `;
+      }).join("");
+
+      $("estimate_table_box").innerHTML = tables;
+      log($("estimate_status"), "估算完成");
+    }catch(e){
+      log($("estimate_status"), "错误：" + e.message);
+      $("estimate_table_box").innerHTML = "";
     }
   };
 
