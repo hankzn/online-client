@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8" />
-<title>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算）</title>
+<title>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算 / Nonce / 浏览器）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root{--fg:#111827;--muted:#6b7280;--ok:#16a34a;--bad:#dc2626;--br:#e5e7eb;--bg:#fff}
@@ -34,7 +34,7 @@
 </style>
 </head>
 <body>
-<h1>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算）</h1>
+<h1>安全转账 · 在线端（验证 / 预演 / 广播 / 查询 / Gas 估算 / Nonce / 浏览器）</h1>
 
 <div class="card">
   <div class="section-title">
@@ -44,6 +44,10 @@
   <div class="col2">
     <label>RPC_URL_1 <input id="rpc1" type="text" placeholder="https://mainnet.infura.io/v3/..." /></label>
     <label>RPC_URL_2 <input id="rpc2" type="text" placeholder="https://eth-mainnet.g.alchemy.com/v2/..." /></label>
+  </div>
+  <div class="row">
+    <button id="detect_chain" class="ghost">识别网络</button>
+    <span id="net_status" class="muted"></span>
   </div>
 </div>
 
@@ -88,6 +92,7 @@
   <div class="row">
     <button id="scan_rawtx" class="ghost">扫码 RawTx</button>
     <button id="broadcast">广播</button>
+    <button id="open_tx" class="ghost">打开浏览器查看交易</button>
     <span id="broadcast_status" class="muted"></span>
   </div>
   <div id="broadcast_table_box" style="margin-top:12px"></div>
@@ -115,6 +120,7 @@
   <div class="row">
     <input id="txhash" type="text" placeholder="0x 交易哈希" style="flex:1" />
     <button id="query">查询</button>
+    <button id="open_tx2" class="ghost">打开浏览器查看交易</button>
     <span id="query_status" class="muted"></span>
   </div>
   <div id="query_table_box" style="margin-top:12px"></div>
@@ -138,6 +144,25 @@
   <p class="muted small">提示：Gas 与“代币数量”通常无关；复杂合约路径除外。本估算以你提供的 tx_human.json 为准。</p>
 </div>
 
+<!-- ⑥ 查询地址最新 Nonce & 区块浏览器（地址） -->
+<div class="card">
+  <div class="section-title">
+    <h2>⑥ 地址 Nonce / 打开浏览器</h2>
+    <span class="muted small">Nonce 使用 <code>eth_getTransactionCount(addr, "pending")</code>；浏览器按链自动匹配</span>
+  </div>
+  <div class="row" style="gap:8px">
+    <input id="addr" type="text" placeholder="0x 地址" style="flex:1" />
+    <button id="fill_addr_from_txhuman" class="ghost">用 tx_human.from 填入</button>
+    <button id="fill_addr_from_intent" class="ghost">用 intent.payee 填入</button>
+  </div>
+  <div class="row">
+    <button id="get_nonce">查询最新 nonce（pending）</button>
+    <button id="open_addr" class="ghost">打开浏览器查看地址</button>
+    <span id="nonce_status" class="muted"></span>
+  </div>
+  <div id="nonce_table_box" style="margin-top:12px"></div>
+</div>
+
 <!-- 依赖：ethers v6 + jsQR（在线端用 CDN 更方便） -->
 <script src="https://cdn.jsdelivr.net/npm/ethers@6.11.1/dist/ethers.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
@@ -145,6 +170,33 @@
 (function(){
   const $ = (id)=>document.getElementById(id);
   const log = (el, msg)=> el.textContent = msg;
+
+  // Explorer 映射（常见链）
+  const EXPLORERS = {
+    1: "https://etherscan.io",
+    11155111: "https://sepolia.etherscan.io",
+    5: "https://goerli.etherscan.io",
+    10: "https://optimistic.etherscan.io",
+    42161: "https://arbiscan.io",
+    137: "https://polygonscan.com",
+    56: "https://bscscan.com",
+    43114: "https://snowtrace.io",
+    8453: "https://basescan.org",
+    324: "https://explorer.zksync.io",
+    42220: "https://celoscan.io",
+    250: "https://ftmscan.com",
+    1101: "https://zkevm.polygonscan.com",
+    100: "https://gnosisscan.io"
+  };
+  const CHAIN_NAMES = {
+    1:"Ethereum Mainnet",11155111:"Sepolia",5:"Goerli",10:"Optimism",42161:"Arbitrum One",
+    137:"Polygon",56:"BNB Smart Chain",43114:"Avalanche C-Chain",8453:"Base",
+    324:"ZKsync Era",42220:"Celo",250:"Fantom",1101:"Polygon zkEVM",100:"Gnosis"
+  };
+
+  let gChainId = null;
+  let gExplorer = null;
+  let gChainName = null;
 
   // 统一 JSON-RPC 调用
   async function rpcCall(url, method, params) {
@@ -164,6 +216,34 @@
     return [u1, u2];
   }
   const toHex = (n)=> "0x"+BigInt(n).toString(16);
+
+  async function detectChainId() {
+    const [u1,u2] = requireRPCs();
+    const c1 = parseInt(await rpcCall(u1,"eth_chainId",[]),16);
+    const c2 = parseInt(await rpcCall(u2,"eth_chainId",[]),16);
+    if (c1 !== c2) {
+      gChainId = c1; // 以 RPC_1 为准，但提示不一致
+      gExplorer = EXPLORERS[c1] || null;
+      gChainName = CHAIN_NAMES[c1] || ("Chain " + c1);
+      log($("net_status"), `RPC_1 chainId=${c1}，RPC_2 chainId=${c2}（不一致，按 RPC_1 处理） · 浏览器：${gExplorer||"未知"}`);
+    } else {
+      gChainId = c1;
+      gExplorer = EXPLORERS[c1] || null;
+      gChainName = CHAIN_NAMES[c1] || ("Chain " + c1);
+      log($("net_status"), `已识别：${gChainName}（chainId=${c1}） · 浏览器：${gExplorer||"未知"}`);
+    }
+  }
+  $("detect_chain").onclick = ()=> detectChainId().catch(e=> log($("net_status"), "错误：" + e.message));
+
+  function ensureTxUrl(th){
+    if (!gExplorer) return null;
+    return `${gExplorer}/tx/${th}`;
+    // （若需 L2 消息或特殊路径，可根据链定制）
+  }
+  function ensureAddrUrl(addr){
+    if (!gExplorer) return null;
+    return `${gExplorer}/address/${addr}`;
+  }
 
   // ========== 摄像头扫码（复用一套） ==========
   // 支持的目标：intent_json | intent_sig | rawtx | tx_human
@@ -296,6 +376,22 @@
     }
   };
 
+  // 打开浏览器查看交易（两个入口按钮共用）
+  async function openTxInExplorer() {
+    try{
+      const th = ($("txhash").value || "").trim();
+      if (!/^0x[0-9a-fA-F]{64}$/.test(th)) throw new Error("请先在『④ 查询交易状态』中输入合法 txhash");
+      if (!gExplorer) await detectChainId();
+      const url = ensureTxUrl(th);
+      if (!url) return alert("未匹配到该链的浏览器，请手动前往对应区块浏览器。");
+      window.open(url, "_blank");
+    }catch(e){
+      alert("无法打开浏览器链接：" + e.message);
+    }
+  }
+  $("open_tx").onclick  = openTxInExplorer;
+  $("open_tx2").onclick = openTxInExplorer;
+
   // ========== ③ 预演（eth_call） ==========
   $("simulate").onclick = async ()=>{
     const box = $("simulate_table_box");
@@ -367,7 +463,6 @@
     try{
       const [u1,u2] = requireRPCs();
       const h = JSON.parse($("tx_human").value||"{}");
-      // 构造 estimateGas 调用体
       const tx = {
         from: h.from,
         to: h.kind==="ETH" ? h.to : h.token,
@@ -377,33 +472,25 @@
       const bufferPct = Math.max(0, Number($("gas_buffer_pct").value || 0));
       const urls=[u1,u2], names=["RPC_1","RPC_2"];
 
-      // 对每条 RPC 并行：estimateGas + feeHistory
       const results = await Promise.allSettled(urls.map(async (u)=>{
         const gasHex = await rpcCall(u,"eth_estimateGas",[tx]);
         const gas = parseInt(gasHex, 16);
         const gasBuffered = Math.ceil(gas * (1 + bufferPct/100));
-
-        // feeHistory：取近 10 个区块，分位点 10 / 50 / 90
         const fh = await rpcCall(u,"eth_feeHistory",[10, "latest", [10,50,90]]);
-        // baseFeePerGas：数组 hex，取最后一个（最新区块的 baseFee）
         const baseFees = (fh.baseFeePerGas||[]).map(x=> BigInt(x));
         const baseFeeLatest = baseFees[baseFees.length-1] ?? 0n;
-        // priority rewards：二维数组 [block][percentileIndex]，取每个分位的中位数（防毛刺）
         const rewards = (fh.reward||[]).map(row=> row.map(x=> BigInt(x)));
         const pickMedian = (arr)=> arr.slice().sort((a,b)=> (a<b?-1:1))[Math.floor(arr.length/2)] || 0n;
         const col = (idx)=> rewards.map(r=> r[idx]).filter(Boolean);
         const p10 = pickMedian(col(0));
         const p50 = pickMedian(col(1));
         const p90 = pickMedian(col(2));
-
-        // 档位系数（可按需调整）
         const tier = (name, priority, baseMul)=> {
-          const maxPriorityFeePerGas = priority; // wei
+          const maxPriorityFeePerGas = priority;
           const maxFeePerGas = baseFeeLatest * BigInt(Math.round(baseMul*100)) / 100n + maxPriorityFeePerGas;
           const feeTotalWei = BigInt(gasBuffered) * maxFeePerGas;
           return { name, gas, gasBuffered, baseFeeLatest, maxPriorityFeePerGas, maxFeePerGas, feeTotalWei };
         };
-        // 低/中/高（baseFee 乘数 1.2 / 1.5 / 2.0）
         return {
           url: u,
           tiers: [
@@ -414,7 +501,6 @@
         };
       }));
 
-      // 渲染
       const fmtGwei = (wei)=> (Number(wei) / 1e9).toFixed(3) + " gwei";
       const fmtEth  = (wei)=> (Number(wei) / 1e18).toFixed(6) + " ETH";
 
@@ -456,6 +542,60 @@
     }catch(e){
       log($("estimate_status"), "错误：" + e.message);
       $("estimate_table_box").innerHTML = "";
+    }
+  };
+
+  // ========== ⑥ Nonce & 浏览器 ==========
+  $("fill_addr_from_txhuman").onclick = ()=>{
+    try{
+      const h = JSON.parse($("tx_human").value||"{}");
+      if (h.from) $("addr").value = h.from;
+    }catch{}
+  };
+  $("fill_addr_from_intent").onclick = ()=>{
+    try{
+      const it = JSON.parse($("intent_json").value||"{}");
+      if (it.payee) $("addr").value = it.payee;
+    }catch{}
+  };
+
+  $("get_nonce").onclick = async ()=>{
+    const box = $("nonce_table_box");
+    try{
+      const [u1,u2] = requireRPCs();
+      const adr = ($("addr").value||"").trim();
+      if (!/^0x[0-9a-fA-F]{40}$/.test(adr)) throw new Error("地址格式不正确");
+      const urls=[u1,u2], names=["RPC_1","RPC_2"];
+      const results = await Promise.allSettled(urls.map(async (u)=>{
+        const hex = await rpcCall(u,"eth_getTransactionCount",[adr,"pending"]);
+        const dec = parseInt(hex,16);
+        return {hex, dec};
+      }));
+      const rows = results.map((r,i)=>{
+        if (r.status==="fulfilled"){
+          return `<tr><td>${names[i]}</td><td class="mono">${escapeHtml(urls[i])}</td><td class="ok">OK</td><td class="mono">${r.value.dec}（${r.value.hex}）</td></tr>`;
+        } else {
+          return `<tr><td>${names[i]}</td><td class="mono">${escapeHtml(urls[i])}</td><td class="bad">FAIL</td><td class="mono">${escapeHtml(r.reason.message||String(r.reason))}</td></tr>`;
+        }
+      }).join("");
+      box.innerHTML = `<table><tr><th>RPC</th><th>URL</th><th>结果</th><th>nonce（十进制 / 十六进制）</th></tr>${rows}</table>`;
+      log($("nonce_status"), "查询完成");
+    }catch(e){
+      log($("nonce_status"), "错误：" + e.message);
+      box.innerHTML = "";
+    }
+  };
+
+  $("open_addr").onclick = async ()=>{
+    try{
+      const adr = ($("addr").value||"").trim();
+      if (!/^0x[0-9a-fA-F]{40}$/.test(adr)) throw new Error("请先在上方输入合法地址");
+      if (!gExplorer) await detectChainId();
+      const url = ensureAddrUrl(adr);
+      if (!url) return alert("未匹配到该链的浏览器，请手动前往对应区块浏览器。");
+      window.open(url, "_blank");
+    }catch(e){
+      alert("无法打开浏览器链接：" + e.message);
     }
   };
 
